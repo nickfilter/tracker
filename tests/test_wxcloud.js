@@ -36,6 +36,13 @@ async function http(method, path, { body, form, headers = {}, redirect = 'manual
   }
   ck('服务启动 healthz', up);
 
+  // 0. 清理历史测试数据（保证可重复运行）
+  try {
+    const dbx = require('../src/db');
+    await dbx.ensureInit();
+    await dbx.query("DELETE FROM conversions WHERE txid IN ('TX1001','TX_GIF')");
+  } catch (e) { console.log('清理跳过:', e.message); }
+
   // 1. init-db
   let r = await http('GET', '/admin/init-db');
   ck('init-db 200', r.status === 200, r.status);
@@ -79,9 +86,18 @@ async function http(method, path, { body, form, headers = {}, redirect = 'manual
   const cid = (r.location || '').match(/s2=([^&]+)/)[1];
   ck('click_id 已生成', cid.length === 16, cid);
 
-  // 7. postback（FB/Google 未启用）
+  // 7. postback（FB/Google 未启用）— 新行为：默认返回 JSON
   r = await http('GET', `/postback?cid=${cid}&payout=12.34&txid=TX1001`);
-  ck('postback 返回 GIF', r.status === 200 && r.headers.get('content-type') === 'image/gif');
+  ck('postback 返回 JSON', r.status === 200 && /application\/json/.test(r.headers.get('content-type') || ''), r.status + ' ' + r.headers.get('content-type'));
+  let pj = {};
+  try { pj = JSON.parse(r.text); } catch (e) {}
+  ck('postback JSON ok=true', pj.ok === true, r.text.slice(0, 200));
+  ck('postback JSON 有 conversion_id', !!pj.conversion_id, r.text.slice(0, 200));
+  ck('postback JSON 回显 click_id', pj.click_id === cid, r.text.slice(0, 200));
+  // 兼容路径：?format=gif 仍返回 1x1 GIF
+  r = await http('GET', `/postback?cid=${cid}&payout=0&txid=TX_GIF&format=gif`);
+  ck('postback ?format=gif 返回 GIF', r.status === 200 && r.headers.get('content-type') === 'image/gif');
+
   await new Promise(r => setTimeout(r, 800)); // 等异步处理
 
   // 8. 去重

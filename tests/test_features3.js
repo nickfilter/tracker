@@ -168,6 +168,8 @@ async function req(path, opts = {}) {
   ok('loading 页保留统计代码位', lp.includes('</head>'));
 
   // 回退：custom 模式但 custom_html 为空 → 回落默认模板
+  // 先清空上次残留的自定义内容，保证用例可重复执行
+  await req('/admin/offers/save-html', { method: 'POST', json: true, body: { oid: oid, html: '', css: '', project: '' } });
   r = await req('/admin/offers/update', {
     method: 'POST',
     body: { id: oid, offer_url: 'https://track.example.com/click?aid=999', name: 'X', title: 'T',

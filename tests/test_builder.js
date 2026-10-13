@@ -19,10 +19,12 @@ async function http(method, path, { body, form, headers = {}, redirect = 'manual
   await http('POST', '/admin/login', { form: { username: 'admin', password: 'admin123' } });
   // 自建一个 Offer，保证测试自给自足（不依赖外部残留数据）
   await http('POST', '/admin/offers', { form: { slug: 'builder-t', offer_url: 'https://track.example.com/c', name: '构建测试', title: 'T', active: '1', weight: '50' } });
-  // 找到 offer id
   let r = await http('GET', '/admin/offers');
-  const m = r.text.match(/builder\?oid=(\d+)/);
-  ck('Offer 列表有"可视化"入口', !!m, 'no builder link');
+  ck('Offer 列表有"可视化"入口', /builder\?oid=\d+/.test(r.text), 'no builder link');
+  // 精确定位 builder-t 的 oid（列表里可能有多条 offer，不能用「第一个」）
+  const row = r.text.split('<tr').find(tr => tr.includes('builder-t') && tr.includes('builder?oid='));
+  const m = row && row.match(/builder\?oid=(\d+)/);
+  ck('定位到 builder-t 的 oid', !!m, row ? row.slice(0, 160) : 'row not found');
   const oid = m && m[1];
 
   // builder 页面

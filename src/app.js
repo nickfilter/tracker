@@ -7,6 +7,8 @@ const config = require('./config');
 const trackers = require('./trackers');
 const pages = require('./pages');
 const views = require('./views');
+const bk = require('./backup');
+const { zip } = require('./zip');
 
 const app = express();
 app.disable('x-powered-by');
@@ -99,28 +101,77 @@ app.get('/go', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ---------------- /postback（立即回 GIF，异步处理） ----------------
-app.get('/postback', async (req, res) => {
-  const q = req.query;
+// ---------------- /postback（联盟回传） ----------------
+// 默认返回 JSON 处理结果（便于联盟面板/调试直接看到状态，且支持重复 txid、未知 cid 等错误回执）；
+// 加 ?format=gif 或 ?gif=1 可退回「立即返回 1x1 GIF」的兼容模式。
+// 处理带超时保护（POSTBACK_TIMEOUT_MS，默认 8000ms）：超时先回 202「已接收」，
+// 后台继续执行，联盟侧不会长时间等待。
+const POSTBACK_TIMEOUT_MS = Math.max(1000, parseInt(process.env.POSTBACK_TIMEOUT_MS || '8000', 10));
+
+function sendGif(res) {
+  res.set('Content-Type', 'image/gif');
+  res.set('Cache-Control', 'no-store');
+  return res.send(GIF);
+}
+
+async function handlePostback(q, res) {
   const clickId = q.cid || q.click_id || q.s2 || null;
   const payout = parseFloat(q.payout || '0') || 0;
   const status = (q.status != null && q.status !== '') ? parseInt(q.status, 10) : 1;
   const txid = q.txid || q.order_id || null;
   const email = q.email || null;
   const phone = q.phone || null;
+  const wantGif = q.format === 'gif' || q.gif === '1' || q.gif === 'true';
+  const started = Date.now();
 
-  // 先返回 1x1 GIF（联盟不等待），处理逻辑放后台异步执行
-  res.set('Content-Type', 'image/gif');
-  res.set('Cache-Control', 'no-store');
-  res.send(GIF);
+  // 入参校验：cid 必填
+  if (!clickId) {
+    if (wantGif) return sendGif(res);
+    return res.status(400).json({
+      ok: false, error: 'missing cid',
+      hint: '需要 cid / click_id / s2 之一',
+      received: { payout, status, txid, email, phone },
+    });
+  }
 
-  setImmediate(async () => {
-    try {
-      const cfg = await config.loadConfig();
-      await trackers.processPostback(cfg, { clickId, payout, status, txid, email, phone });
-    } catch (e) { console.error('postback async:', e); }
-  });
-});
+  try {
+    const cfg = await config.loadConfig();
+    const work = trackers.processPostback(cfg, { clickId, payout, status, txid, email, phone });
+    work.catch((e) => console.error('postback:', e));
+
+    const timer = new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), POSTBACK_TIMEOUT_MS));
+    const result = await Promise.race([work, timer]);
+
+    if (wantGif) return sendGif(res);
+
+    if (result && result.__timeout) {
+      res.status(202);
+      return res.json({
+        ok: true, accepted: true, async: true,
+        message: '已接收，正在后台处理（超过等待上限）',
+        click_id: clickId, txid, elapsed_ms: Date.now() - started,
+      });
+    }
+
+    // 业务结果统一返回 200 + 结构化 JSON，方便联盟面板看清原因：
+    //   ok=true  转化已记录
+    //   ok=false 未记录（未知 click / 重复 txid 等），字段里带 code 与 hint
+    const ok = !!(result && result.ok && !result.error && !result.dup);
+    return res.status(200).json(Object.assign({
+      ok,
+      click_id: clickId, txid, payout, status,
+      elapsed_ms: Date.now() - started,
+    }, result || {}));
+  } catch (e) {
+    console.error('postback error:', e);
+    if (wantGif) return sendGif(res);
+    return res.status(500).json({ ok: false, error: String(e.message || e), click_id: clickId, txid });
+  }
+}
+
+app.get('/postback', (req, res) => handlePostback(req.query, res));
+// 兼容联盟习惯：部分联盟用 POST 回传
+app.post('/postback', (req, res) => handlePostback(Object.assign({}, req.query, req.body || {}), res));
 
 // ---------------- /api/lead ----------------
 app.post('/api/lead', async (req, res, next) => {
@@ -276,6 +327,67 @@ app.post('/admin/offers/save-html', async (req, res, next) => {
       gjs_project: htmlStr ? String(f.project || '') : '',
     });
     res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---------------- 后台：数据备份 ----------------
+app.get('/admin/backup', async (req, res, next) => {
+  const u = guard(req, res); if (!u) return;
+  try {
+    const counts = await dbx.exportSummary();
+    res.send(views.backupHtml(counts, req.query.done || '', req.query.err || ''));
+  } catch (e) { next(e); }
+});
+
+// 下载备份：format = json | csv | sql（默认 json）
+app.get('/admin/backup/download', async (req, res, next) => {
+  // 下载接口用 401 JSON 而非 302 重定向，避免浏览器把登录页 HTML 当成文件下载
+  const u = guard(req, res, true); if (!u) return;
+  try {
+    const format = String(req.query.format || 'json').toLowerCase();
+    const mask = req.query.mask !== '0'; // 默认脱敏；mask=0 导出原始密钥（慎用）
+    if (!['json', 'csv', 'sql'].includes(format)) {
+      return res.status(400).json({ error: 'unsupported format, use json|csv|sql' });
+    }
+    const payload = await dbx.exportAll({ maskSecrets: mask });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const base = `clickdealer-backup-${stamp}`;
+
+    if (format === 'json') {
+      const body = Buffer.from(JSON.stringify(payload, null, 2), 'utf8');
+      res.set('Content-Type', 'application/json; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="${base}.json"`);
+      res.set('Content-Length', String(body.length));
+      return res.send(body);
+    }
+
+    if (format === 'sql') {
+      const body = Buffer.from(bk.toSql(payload), 'utf8');
+      res.set('Content-Type', 'application/sql; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="${base}.sql"`);
+      res.set('Content-Length', String(body.length));
+      return res.send(body);
+    }
+
+    // CSV → 打包 zip（每张表一个 .csv + meta.json）
+    const files = [];
+    for (const [t, rows] of Object.entries(payload.data || {})) {
+      files.push({ name: `${t}.csv`, data: bk.toCsv(rows) });
+    }
+    files.push({ name: 'meta.json', data: JSON.stringify(payload.meta, null, 2) });
+    files.push({
+      name: 'README.txt',
+      data: 'ClickDealer 联盟归因系统 · CSV 备份\r\n'
+        + '导出时间: ' + payload.meta.exported_at + '\r\n'
+        + '每张表对应一个 csv 文件（UTF-8 带 BOM，可直接用 Excel 打开）。\r\n'
+        + (payload.meta.secrets_masked ? '密钥字段已脱敏，恢复后需重新配置。\r\n' : '')
+        + (payload.meta.warnings.length ? '注意:\r\n- ' + payload.meta.warnings.join('\r\n- ') + '\r\n' : ''),
+    });
+    const buf = zip(files);
+    res.set('Content-Type', 'application/zip');
+    res.set('Content-Disposition', `attachment; filename="${base}-csv.zip"`);
+    res.set('Content-Length', String(buf.length));
+    return res.send(buf);
   } catch (e) { next(e); }
 });
 

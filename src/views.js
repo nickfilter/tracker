@@ -5,6 +5,7 @@ const MENU = [
   ['/admin/country-report', '🌍 国家日报表'],
   ['/admin/realtime', '⚡ 实时数据'],
   ['/admin/offers', '📦 Offer 管理'],
+  ['/admin/backup', '💾 数据备份'],
   ['/admin/config', '🛠 系统配置'],
   ['/admin/change-password', '🔐 修改密码'],
 ];
@@ -211,6 +212,78 @@ function offerEditHtml(o) {
 <p style="margin-top:14px"><button class="act" type="submit">保存修改</button> <a class="act" href="/admin/offers/builder?oid=${o._id || o.id}" style="text-decoration:none;background:#7c3aed">🎨 可视化编辑落地页</a> <a class="act" href="/admin/offers" style="text-decoration:none;background:#334155">返回</a></p>
 </form></div>`;
   return base('/admin/offers', content);
+}
+
+// 数据备份页：各表记录数 + 三种格式下载
+const TABLE_LABELS = {
+  clicks: '点击记录',
+  conversions: '转化记录',
+  offers: 'Offer 配置',
+  third_party_trackers: '三方统计',
+  settings: '系统设置',
+  users: '后台账号',
+};
+function backupHtml(counts, done, err) {
+  const total = Object.values(counts || {}).reduce((a, b) => a + (Number(b) || 0), 0);
+  const rows = Object.entries(counts || {}).map(([t, n]) => {
+    const label = TABLE_LABELS[t] || t;
+    const val = (n === null || n === undefined)
+      ? '<span class="neg">读取失败</span>'
+      : Number(n).toLocaleString('en-US');
+    return `<tr><td>${escapeAttr(t)}</td><td class="muted">${escapeAttr(label)}</td><td><b>${val}</b></td></tr>`;
+  }).join('') || '<tr><td colspan="3" class="muted">暂无数据</td></tr>';
+
+  const content = `<h1>💾 数据备份</h1>
+${done ? `<div class="panel" style="border-color:#065f46;background:#062e26"><p class="pos" style="margin:0">✅ 备份文件已下载（${escapeAttr(done)}）。请妥善保存到本地或云盘。</p></div>` : ''}
+${err ? `<div class="panel" style="border-color:#7f1d1d;background:#2a1414"><p class="neg" style="margin:0">❌ 备份失败：${escapeAttr(err)}</p></div>` : ''}
+
+<div class="panel">
+  <h2 style="margin-top:0">📊 当前数据量</h2>
+  <div class="scroll"><table><tr><th>数据表</th><th>说明</th><th>记录数</th></tr>${rows}</table></div>
+  <p class="tiny muted" style="margin:12px 0 0">合计 <b>${total.toLocaleString('en-US')}</b> 条记录</p>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">⬇️ 一键下载备份</h2>
+  <p class="tiny muted" style="margin:0 0 14px">选择格式后立即开始下载，文件包含全部 6 张业务表。</p>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px">
+    <div style="border:1px solid #334155;border-radius:12px;padding:16px">
+      <p style="margin:0 0 6px"><b>🗂 JSON</b></p>
+      <p class="tiny muted" style="margin:0 0 12px">完整结构化数据 + 元信息，适合程序读取或迁移到其它系统。</p>
+      <a class="act" style="margin:0" href="/admin/backup/download?format=json">下载 JSON</a>
+    </div>
+    <div style="border:1px solid #334155;border-radius:12px;padding:16px">
+      <p style="margin:0 0 6px"><b>📊 CSV (zip)</b></p>
+      <p class="tiny muted" style="margin:0 0 12px">每张表一个 CSV 文件，UTF-8 带 BOM，可直接用 Excel 打开分析。</p>
+      <a class="act" style="margin:0" href="/admin/backup/download?format=csv">下载 CSV 包</a>
+    </div>
+    <div style="border:1px solid #334155;border-radius:12px;padding:16px">
+      <p style="margin:0 0 6px"><b>🧾 SQL</b></p>
+      <p class="tiny muted" style="margin:0 0 12px">可重放的 INSERT 脚本，用 psql 一条命令恢复整库。</p>
+      <a class="act" style="margin:0" href="/admin/backup/download?format=sql">下载 SQL</a>
+    </div>
+  </div>
+
+  <div style="margin-top:16px;padding-top:14px;border-top:1px solid #334155">
+    <p class="tiny" style="margin:0 0 8px">🔐 <b>密钥脱敏</b>：默认开启。<code>users</code> 表的密码哈希与 <code>settings</code> 里的 FB/Google 密钥会被掩码成 <code>abc***xy</code>，避免备份文件泄露凭证。恢复后需重新配置这些密钥。</p>
+    <p class="tiny muted" style="margin:0">需要含密钥的完整备份（仅限私密环境）：
+      <a href="/admin/backup/download?format=json&amp;mask=0" onclick="return confirm('⚠️ 将导出含明文密钥的备份文件，确定继续？');">导出原始密钥（慎用）</a>
+    </p>
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">ℹ️ 使用说明</h2>
+  <ul class="tiny muted" style="margin:0;padding-left:20px;line-height:1.9">
+    <li>备份为<b>实时快照</b>，点击下载即刻生成，包含当前时刻的全部数据。</li>
+    <li>单表导出上限 <b>20 万行</b>；超出时文件内 <code>meta.warnings</code> 会提示，超大数据量建议直接用 <code>pg_dump</code>。</li>
+    <li><b>恢复 JSON：</b>按 <code>data</code> 下各表依次插入即可，注意保留 <code>id</code> 与外键对应关系。</li>
+    <li><b>恢复 SQL：</b><code>psql "你的DATABASE_URL" -f clickdealer-backup-xxx.sql</code>。脚本会先 <code>TRUNCATE</code> 同名表，<b>请勿在生产库直接执行</b>。</li>
+    <li>建议定期备份并异地保存（本地磁盘 + 云盘各一份）。</li>
+  </ul>
+</div>`;
+  return base('/admin/backup', content);
 }
 
 function changePasswordHtml(error, ok) {
@@ -512,4 +585,5 @@ boot();
 module.exports = {
   loginPage, dashboardHtml, trackersHtml, offersHtml, offerEditHtml,
   changePasswordHtml, configHtml, countryReportHtml, realtimeHtml, builderHtml,
+  backupHtml,
 };

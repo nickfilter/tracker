@@ -13,11 +13,14 @@ Render 对外部服务器回调友好，ClickDealer 的 postback、广告落地�
 - 🎨 **GrapesJS 可视化编辑**：后台拖拽搭建落地页，5 个内置「归因组件」区块，按钮链接填 `GO` 自动跳 Offer，保存即生效、可无损再次编辑
 - ⏳ **内置 Loading 过渡页**：进度环 + 倒计时自动跳转，广告点击先暖场再进 Offer，参数全量透传
 - 🔗 `/go` 点击登记 + 302 跳 ClickDealer（URL 带 `s2=点击ID`，**UTM/gclid/gad_*/ttclid 全量透传**）
-- 📥 `/postback` 接收联盟回传：**立即返回 1x1 GIF**，处理逻辑异步执行（联盟不超时）
+- 📥 `/postback` 接收联盟回传：**立即返回 JSON**，处理逻辑异步执行（联盟不超时）
+  - 加 `?format=gif` 或 `?gif=1` 可切回 **1x1 GIF**（兼容 `<img>` 像素回传）
+  - 超过 `POSTBACK_TIMEOUT_MS`（默认 8000ms）未处理完 → 返回 **202 Accepted** + `async:true`
 - 📘 **Facebook CAPI**：`event_id = txid` 去重；`fbc/fbp/ip/ua` 归因；邮箱/电话 SHA-256 进 `user_data`
 - 📗 **Google 增强转化**：`uploadClickConversions` + `userIdentifiers`（base64 哈希邮箱/电话）
 - 🧩 三方统计宏回传（`{clickid}` `{payout}` `{txid}` `{offer}` `{source}` `{country}`）
 - 🛠 后台：统计概览 / 三方统计 / 国家日报表 / 实时数据(5s 自动刷新 + FB·G 回写状态) / Offer 管理 / 系统配置(含 CAPI 自检) / 修改密码
+- 💾 **一键数据备份**：后台 `/admin/backup` 一键下载 **JSON / CSV(zip) / SQL** 三种格式，默认自动**脱敏**密钥与密码哈希
 - 📜 隐私政策 + 服务条款页（符合 FB/Google 广告政策）
 - 🩺 数据库连接失败时返回**中文排障页**（当前配置 + 修复步骤）
 
@@ -34,10 +37,14 @@ clickdealer-render/
 │   ├── config.js      # 配置合并（环境变量 > DB settings > 默认值）
 │   ├── security.js    # PBKDF2 密码 / HMAC 会话 / PII 哈希
 │   ├── trackers.js    # /go、/postback、FB CAPI、Google 增强、三方宏、CAPI 自检
-│   ├── pages.js       # 公开落地页 / hub / 隐私 / 条款
-│   └── views.js       # 后台管理 HTML + GrapesJS 编辑器页
+│   ├── backup.js      # 备份序列化：CSV（BOM/转义）+ SQL（TRUNCATE/INSERT/setval）
+│   ├── zip.js         # 零依赖 ZIP 打包（CRC32 + deflateRaw，供 CSV 批量下载）
+│   ├── pages.js       # 公开落地页 / Loading 过渡页 / hub / 隐私 / 条款
+│   └── views.js       # 后台管理 HTML + GrapesJS 编辑器页 + 备份页
+├── tests/             # 5 个端到端测试套件（共 229 项断言）
 ├── render.yaml        # Blueprint：自动建 Web Service + Postgres 并注入 DATABASE_URL
 ├── Dockerfile         # 可选：Docker 方式部署
+├── .env.example       # 全部环境变量清单（按代码真实变量名逐项注释）
 ├── package.json
 └── README.md
 ```
@@ -185,18 +192,48 @@ node src/server.js
 
 全部可用环境变量（含 FB / Google / 站点信息 / 法务页字段）见仓库根目录 **`.env.example`**，已按代码里的真实变量名逐项列出并加注释。
 
-### 已通过的自动化测试（真实 PostgreSQL 环境，共 **129 项**）
+### postback 返回格式
+
+| 场景 | 状态码 | 响应 |
+| --- | --- | --- |
+| 默认（处理成功） | 200 | `{"ok":true,"click_id":"…","txid":"…","payout":12.34,"status":1,"conversion_id":7,"fb_sent":false,"g_sent":false,"third_party_sent":false,"elapsed_ms":3}` |
+| 重复 txid（幂等） | 200 | `{"ok":false,"dup":true,"code":"DUPLICATE_TXID","hint":"txid=… 已处理过…"}` |
+| 缺少 cid | 400 | `{"ok":false,"error":"missing cid","hint":"需要 cid / click_id / s2 之一"}` |
+| 未找到点击 | 200 | `{"ok":false,"code":"UNKNOWN_CLICK_ID","hint":"未找到 cid=… 对应的点击记录"}` |
+| 处理超时 | 202 | `{"ok":true,"accepted":true,"async":true,…}` |
+| `?format=gif` / `?gif=1` | 200 | **1x1 GIF**（`image/gif`，用于像素回传） |
+
+> 幂等：同一 `txid` 重复回调只写入一条转化，返回 `ok:false` + `code:DUPLICATE_TXID`，联盟侧可据此判断是否已计费。
+> 异步：`processPostback` 与响应解耦——即使下游 FB/Google 接口慢，联盟也不会拿到 5xx。
+
+### 一键数据备份（`/admin/backup`）
+
+后台「💾 数据备份」页显示各表数据量，并提供三种下载格式：
+
+| 格式 | 内容 | 用途 |
+| --- | --- | --- |
+| **JSON** | 全表结构化数组 + `meta`（导出时间/版本/表计数） | 程序化迁移、二次处理 |
+| **CSV (zip)** | 每表一个 `.csv`（UTF-8 BOM，Excel 直开）+ `meta.json` + `README.txt` | 人工查看、导入表格软件 |
+| **SQL** | `TRUNCATE … RESTART IDENTITY CASCADE` + `INSERT` + `setval(...)` | 在新库一键重放恢复 |
+
+- 默认**脱敏**：`users.password_hash / salt` 掩码；`settings.global` 里的 `*_TOKEN / *_SECRET / *_PASSWORD / CLIENT_SECRET / DEVELOPER_TOKEN` 等递归掩码
+- 需要原始数据（含明文密钥）时加 `?mask=0`（**仅限内网/本地**，公网慎用）
+- 导出为流式分表查询，单表上限 20 万行，避免内存打爆
+
+### 已通过的自动化测试（真实 PostgreSQL 环境，共 **229 项**）
 
 | 测试 | 项数 | 覆盖 |
 | --- | --- | --- |
-| `test_wxcloud.js` | 35 | 登录/鉴权/配置/点击/Postback/线索/报表/404 全流程 |
-| `test_builder.js` | 20 | GrapesJS 保存·恢复·清空回落·自定义页渲染·未登录 401 |
+| `test_wxcloud.js` | 39 | 登录/鉴权/配置/点击/Postback(JSON)/线索/报表/404 全流程 |
+| `test_builder.js` | 21 | GrapesJS 保存·恢复·清空回落·自定义页渲染·未登录 401 |
 | `test_wx_fb.js` | 9 | FB CAPI 字段（event_id/fbc/fbp/ip/ua/em hash）+ Google 增强转化 |
 | `test_features3.js` | 65 | **参数全量透传** · **归因组件区块** · **Loading 过渡页** · 模式优先级回归 |
+| `test_backup.js` | 95 | 备份页/JSON/CSV/SQL 三格式 · 密钥脱敏 · 鉴权 · SQL 真实重放 · postback JSON 全分支 |
 
 ```bash
 # 跑测试（需服务已在 8099 端口运行）
-node tests/test_wxcloud.js && node tests/test_builder.js && node tests/test_wx_fb.js && node tests/test_features3.js
+node tests/test_wxcloud.js && node tests/test_builder.js && node tests/test_wx_fb.js \
+  && node tests/test_features3.js && node tests/test_backup.js
 ```
 
 ---

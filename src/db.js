@@ -322,6 +322,143 @@ async function dashboardStats() {
   return { totalClicks: Number(c1[0].c), totalConv: Number(c2[0].c), totalRev: Number(c3[0].s) || 0, bySource };
 }
 
+// ---------------- 数据备份 / 导出 ----------------
+// 导出全部业务表；users 表剔除 password_hash / salt 等敏感字段，
+// settings 表（单行 key='global'，value 是整个配置 JSON）里的密钥字段默认也做脱敏，
+// 避免备份文件泄露凭证。
+const BACKUP_TABLES = ['offers', 'clicks', 'conversions', 'third_party_trackers', 'settings', 'users'];
+// 单表导出上限（防止超大表把内存撑爆）；如需全量请直连数据库用 pg_dump
+const BACKUP_ROW_LIMIT = 200000;
+// settings.global 这个 JSON 里，key 命中此正则的字段会被掩码
+const SENSITIVE_SETTING_KEYS = /TOKEN|SECRET|PASSWORD|CLIENT_SECRET|REFRESH_TOKEN|ACCESS_TOKEN|DEVELOPER_TOKEN/i;
+// users 表需要剔除的列
+const USER_SENSITIVE_COLS = ['password_hash', 'salt'];
+
+// 各表用于排序/分批的排序列（settings 主键是 key，没有 id 列）
+const BACKUP_ORDER_COL = {
+  offers: 'id', clicks: 'id', conversions: 'id',
+  third_party_trackers: 'id', users: 'id', settings: 'key',
+};
+
+function maskValue(v) {
+  if (v == null || v === '') return v;
+  const s = String(v);
+  if (s.length <= 6) return '***';
+  return s.slice(0, 3) + '***' + s.slice(-2);
+}
+
+// 对配置 JSON 对象递归掩码密钥字段（只处理一层键，够用且不会误伤嵌套结构）
+function maskConfigObject(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(maskConfigObject);
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (SENSITIVE_SETTING_KEYS.test(k)) out[k] = maskValue(v);
+    else if (v && typeof v === 'object') out[k] = maskConfigObject(v);
+    else out[k] = v;
+  }
+  return out;
+}
+
+// settings 行的脱敏：value 是 JSON 字符串（如 {"FB_ACCESS_TOKEN":"..."}）
+function maskSettingsRow(row, maskSecrets) {
+  if (!maskSecrets) return row;
+  const c = Object.assign({}, row);
+  const raw = c.value;
+  if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+    try {
+      c.value = JSON.stringify(maskConfigObject(JSON.parse(raw)));
+    } catch (e) { /* 非 JSON 就保留原样 */ }
+  } else if (SENSITIVE_SETTING_KEYS.test(String(c.key || ''))) {
+    // 兼容「一行一项 key/value」的老结构
+    c.value = maskValue(raw);
+  }
+  return c;
+}
+
+/**
+ * 导出全部数据。
+ * @param {object} opts
+ *   - maskSecrets: 是否对密钥类字段脱敏（默认 true）
+ *   - limit: 单表行数上限（默认 200000）
+ * @returns {Promise<object>} 可 JSON.stringify 的对象
+ */
+async function exportAll(opts = {}) {
+  const maskSecrets = opts.maskSecrets !== false;
+  const limit = Math.max(1, parseInt(opts.limit, 10) || BACKUP_ROW_LIMIT);
+  const tables = {};
+  const counts = {};
+  const warnings = [];
+
+  for (const t of BACKUP_TABLES) {
+    const orderCol = BACKUP_ORDER_COL[t] || 'id';
+    let rows;
+    try {
+      rows = await query(`SELECT * FROM ${t} ORDER BY ${orderCol} LIMIT $1`, [limit]);
+    } catch (e) {
+      // 首选排序列不存在时（老库结构差异）退化为无序查询
+      try {
+        rows = await query(`SELECT * FROM ${t} LIMIT $1`, [limit]);
+      } catch (e2) {
+        // 表不存在（老库未迁移）时跳过，不让整份备份失败
+        warnings.push(`表 ${t} 读取失败，已跳过：${e2.message}`);
+        tables[t] = [];
+        counts[t] = 0;
+        continue;
+      }
+    }
+    // 超限提示
+    const total = await query(`SELECT COUNT(*) c FROM ${t}`);
+    const totalN = Number(total[0].c);
+    if (totalN > rows.length) {
+      warnings.push(`表 ${t} 共 ${totalN} 行，本次仅导出前 ${rows.length} 行（上限 ${limit}）`);
+    }
+
+    if (t === 'users') {
+      rows = rows.map((r) => {
+        const c = Object.assign({}, r);
+        for (const col of USER_SENSITIVE_COLS) {
+          if (col in c) c[col] = maskSecrets ? maskValue(c[col]) : '[已移除]';
+        }
+        return c;
+      });
+    }
+    if (t === 'settings') {
+      rows = rows.map((r) => maskSettingsRow(r, maskSecrets));
+    }
+
+    tables[t] = rows;
+    counts[t] = rows.length;
+  }
+
+  return {
+    meta: {
+      app: 'clickdealer-affiliate-tracker',
+      version: 2,
+      exported_at: new Date().toISOString(),
+      tables: BACKUP_TABLES,
+      counts,
+      secrets_masked: maskSecrets,
+      row_limit: limit,
+      warnings,
+      note: 'secrets_masked=true 时 users.password_hash/salt 与 settings 里的密钥已掩码，恢复后需重新配置。',
+    },
+    data: tables,
+  };
+}
+
+// 备份页概览：各表行数（不读取数据，轻量）
+async function exportSummary() {
+  const out = {};
+  for (const t of BACKUP_TABLES) {
+    try {
+      const r = await query(`SELECT COUNT(*) c FROM ${t}`);
+      out[t] = Number(r[0].c);
+    } catch (e) { out[t] = null; }
+  }
+  return out;
+}
+
 module.exports = {
   getPool, query, insert, ensureInit, isDbConnError,
   getClick, createClick, saveLead,
@@ -329,4 +466,6 @@ module.exports = {
   listOffers, getOffer, getOfferById, createOffer, updateOffer, deleteOffer,
   listTrackers, createTracker, deleteTracker,
   getUser, changePassword, dashboardStats,
+  exportAll, exportSummary,
+  __DDL_FOR_TEST__: DDL.join(';\n') + ';',
 };

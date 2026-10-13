@@ -81,11 +81,17 @@ async function registerClick(offer, reqInfo) {
 // ---------------- /postback ----------------
 async function processPostback(cfg, params) {
   const { clickId, payout, status, txid, email, phone } = params;
-  if (!clickId) return { error: 'missing cid' };
-  if (await dbx.conversionDup(txid)) return { dup: true };
+  if (!clickId) {
+    return { error: 'missing cid', code: 'MISSING_CID', hint: '需要 cid / click_id / s2 之一' };
+  }
+  if (await dbx.conversionDup(txid)) {
+    return { dup: true, code: 'DUPLICATE_TXID', hint: `txid=${txid} 已处理过，本次忽略（FB 侧同样按 event_id 去重）` };
+  }
 
   const click = await dbx.getClick(clickId);
-  if (!click) return { error: 'unknown click' };
+  if (!click) {
+    return { error: 'unknown click', code: 'UNKNOWN_CLICK_ID', hint: `未找到 cid=${clickId} 对应的点击记录` };
+  }
 
   const finalEmail = email || click.email;
   const finalPhone = phone || click.phone;
@@ -115,7 +121,15 @@ async function processPostback(cfg, params) {
     }
   }
   if (convId) await dbx.updateConversionFeedback(convId, results.fb, results.g);
-  return { ok: true, convId, results };
+  return {
+    ok: true,
+    message: '转化已记录，回传状态见 fb/g 字段',
+    conversion_id: convId,
+    offer_key: click.offer_key,
+    revenue: payout,
+    fb_sent: results.fb, g_sent: results.g, third_party_sent: results.third,
+    results,
+  };
 }
 
 // ---------------- Facebook CAPI ----------------
