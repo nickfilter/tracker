@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.dev.vars
+*.zip
+README.md
+container.config.json

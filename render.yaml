@@ -1,0 +1,47 @@
+# Render Blueprint：一键创建 Web Service + Postgres 并自动注入 DATABASE_URL
+# 用法：Render Dashboard → New → Blueprint → 选择本仓库即可
+services:
+  - type: web
+    name: clickdealer
+    runtime: node
+    plan: free                      # 免费实例会休眠（首个请求慢），生产建议 starter
+    buildCommand: npm install
+    startCommand: node src/server.js
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clickdealer-db
+          property: connectionString
+      - key: NODE_VERSION
+        value: "20"
+      - key: SESSION_SECRET
+        generateValue: true         # 自动生成随机密钥
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false                 # 部署时在面板手动填（必填）
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: FB_ENABLED
+        value: "0"
+      - key: FB_PIXEL_ID
+        sync: false
+      - key: FB_ACCESS_TOKEN
+        sync: false
+      - key: FB_TEST_EVENT_CODE
+        sync: false
+      - key: GOOGLE_ENABLED
+        value: "0"
+      - key: GA_TAG_ID
+        sync: false
+      - key: BASE_URL
+        sync: false
+
+databases:
+  - name: clickdealer-db
+    databaseName: clickdealer
+    user: clickdealer
+    plan: basic-256mb               # 免费层 plan: free（90 天后过期，仅测试用）
+    postgresMajorVersion: "16"
